@@ -160,7 +160,9 @@ class VectorClock:
         self.vec[self.node_id] = self.vec.get(self.node_id, 0) + 1
         if self.vec[self.node_id] >= self.CEILING:
             self.epoch += 1
-            self.vec = {k: 0 for k in self.vec}
+            # Only reset the local counter; other nodes' counters are preserved
+            # so causal relationships across epoch boundaries remain intact.
+            self.vec[self.node_id] = 0
         return {"e": self.epoch, "v": dict(self.vec)}
 
     def merge(self, remote: Dict[str, Any]) -> bool:
@@ -287,6 +289,20 @@ class Spore:
         """Register a node's Ed25519 public key as an authorized member of this swarm."""
         self.swarm_members[public_key] = host_id
 
+    def deny_member(self, public_key: str) -> None:
+        """Remove a node from the authorized membership registry."""
+        self.swarm_members.pop(public_key, None)
+
+    def is_member(self, public_key: str) -> bool:
+        """Return True if the public key is an authorized member.
+
+        If the registry is empty, membership is NOT automatically granted
+        (no allow-all fallback) — a node must be explicitly authorized.
+        """
+        if not self.swarm_members:
+            return False
+        return public_key in self.swarm_members
+
     def set_encryption_key(self, key: bytes) -> None:
         """Set the optional AEAD encryption key for this Spore instance."""
         self.encryption_key = key
@@ -350,18 +366,18 @@ class Spore:
         return compressed, msg_id.encode()
 
     def unpack(self, raw: bytes) -> Optional[Dict[str, Any]]:
-        msg_id = hashlib.blake2b(raw).hexdigest()
-
-        # Exact replay detection via message ID set
-        if msg_id in self.message_history:
-            return None  # replay detected
-
         # Optional AEAD decryption: if we have a key, try to unwrap first
         if self.encryption_key:
             decrypted = decrypt_spore(raw, self.encryption_key)
             if decrypted is None:
                 return None
             raw = decrypted
+
+        msg_id = hashlib.blake2b(raw).hexdigest()
+
+        # Exact replay detection via message ID set (computed on plaintext, matching pack)
+        if msg_id in self.message_history:
+            return None  # replay detected
 
         # Decompress
         try:
@@ -387,18 +403,26 @@ class Spore:
         except Exception:
             return None
 
+        # Try to decode body for host_id (safe: signatures are verified below)
+        try:
+            body = json.loads(body_bytes.decode())
+            host_id = body.get("n", "?")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            host_id = "?"
+
         # Verify group membership (HMAC)
         if not self._verify_group(body_bytes, group_sig):
-            return {"__poison__": True, "from": blob.get("n", "?"), "reason": "invalid_group_signature"}
+            return {"__poison__": True, "from": host_id, "reason": "invalid_group_signature"}
 
         # Verify node identity (Ed25519)
         if not self._verify_node(body_bytes, node_sig, node_pubkey):
-            return {"__poison__": True, "from": blob.get("n", "?"), "reason": "invalid_node_signature"}
+            return {"__poison__": True, "from": host_id, "reason": "invalid_node_signature"}
 
         # Optional: verify the node is an authorized member of this swarm
-        if node_pubkey and node_pubkey in self.swarm_members:
-            if self.swarm_members[node_pubkey] != blob.get("n", ""):
-                return {"__poison__": True, "from": blob.get("n", "?"), "reason": "unauthorized_member"}
+        if not self.is_member(node_pubkey):
+            return {"__poison__": True, "from": host_id, "reason": "unauthorized_member"}
+        if self.swarm_members.get(node_pubkey) != host_id:
+            return {"__poison__": True, "from": host_id, "reason": "host_id_mismatch"}
 
         # Only mark as seen after successful verification
         self.bloom.add(raw)
@@ -406,7 +430,6 @@ class Spore:
         self._prune_history()
         self._save_history()
 
-        body = json.loads(body_bytes.decode())
         self.clock.merge(body.get("vc", {}))
         return body
 
@@ -517,6 +540,7 @@ class SwarmTrace:
     entries: Dict[Tuple[str, str], SwarmTraceEntry] = field(default_factory=dict)
     removed: Set[Tuple[str, str]] = field(default_factory=set)
     ttl_seconds: float = 3600.0
+    payloads: Dict[str, bytes] = field(default_factory=dict)
 
     def add(self, msg_id: str, tag: str, vector_clock: Dict[str, Any]) -> None:
         key = (msg_id, tag)
@@ -524,6 +548,18 @@ class SwarmTrace:
             msg_id=msg_id, tag=tag, vector_clock=vector_clock, ttl_seconds=self.ttl_seconds
         )
         self.removed.discard(key)
+
+    def add_payload(self, msg_id: str, payload: bytes) -> None:
+        """Store a payload for later retrieval by missing-message requests."""
+        self.payloads[msg_id] = payload
+
+    def get_payload(self, msg_id: str) -> Optional[bytes]:
+        """Retrieve a stored payload."""
+        return self.payloads.get(msg_id)
+
+    def remove_payload(self, msg_id: str) -> None:
+        """Drop a stored payload."""
+        self.payloads.pop(msg_id, None)
 
     def remove(self, msg_id: str, tag: str) -> None:
         self.removed.add((msg_id, tag))
@@ -543,14 +579,28 @@ class SwarmTrace:
         for key in dead_keys:
             self.entries.pop(key, None)
             self.removed.add(key)
+            # Also drop payloads for pruned entries
+            self.payloads.pop(key[0], None)
         return pruned
 
     def merge(self, other: "SwarmTrace") -> None:
-        """OR-Set merge: union of adds, union of removes, and do not resurrect removed keys."""
+        """OR-Set merge with concurrent remove+add resolution.
+
+        - Adds from `other` are applied unless we have removed the same key
+          (self's remove wins on concurrent remove+add).
+        - Removes from `other` are applied to our entries if present.
+        - Payloads are unioned (last-write-wins by timestamp).
+        """
         for key, e in other.entries.items():
             if key not in self.removed:
                 self.entries[key] = e
-        self.removed |= other.removed
+        for key in other.removed:
+            if key in self.entries:
+                self.entries.pop(key, None)
+            self.removed.add(key)
+        # Merge payloads (union, last-write-wins by timestamp)
+        for msg_id, payload in other.payloads.items():
+            self.payloads[msg_id] = payload
 
 
 # ───────────────────────── GossipTransport (libp2p GossipSub + CRDT) ────────────────────
@@ -627,6 +677,31 @@ class GossipTransport:
         """Alias for publish to make GossipSub semantics explicit."""
         self.publish(topic, payload, sender_id, vector_clock, message_id)
 
+    def start(self) -> None:
+        """Start the transport: create libp2p host and GossipSub if available."""
+        if not self._gossip_enabled:
+            return
+        try:
+            from libp2p.core.host import Host
+            from libp2p.transport.tcp import TcpTransport
+            from libp2p.pubsub.gossipsub import GossipSub
+
+            # Create a libp2p host with TCP transport
+            self._host = Host(TcpTransport())
+            self._gossipsub = GossipSub(self._host)
+        except Exception:
+            self._gossip_enabled = False
+
+    def stop(self) -> None:
+        """Stop the transport."""
+        if self._host:
+            try:
+                self._host.close()
+            except Exception:
+                pass
+        self._host = None
+        self._gossipsub = None
+
 
 if __name__ == "__main__":
     # Group secret is shared between nodes (HMAC verifies group membership)
@@ -667,6 +742,10 @@ if __name__ == "__main__":
         received[msg.message_id] = msg
 
     gossip_bob.subscribe("spore", on_message)
+
+    # Authorize members: each node must explicitly register the other's Ed25519 key
+    alice.authorize_member(bob.public_key, "node-beta")
+    bob.authorize_member(alice.public_key, "node-alpha")
 
     spore, msg_id = alice.pack({"intent": "resonate", "phase": 0.7})
     spore, msg_id = alice.pack({"intent": "grow", "phase": 0.9})

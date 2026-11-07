@@ -65,6 +65,9 @@ def test_spore_node_identity():
 
     alice = Spore("node-alpha", group_secret, alice_priv, alice_pub)
     bob = Spore("node-beta", group_secret, bob_priv, bob_pub)
+    # Authorize members (deny-if-registry-nonempty)
+    alice.authorize_member(bob.public_key, "node-beta")
+    bob.authorize_member(alice.public_key, "node-alpha")
 
     # Pack message
     spore, msg_id = alice.pack({"intent": "hello", "data": [1, 2, 3]})
