@@ -1,6 +1,6 @@
 # Spore-Protocol
 
-**Spore Protocol v0.4** — a self-contained messaging protocol for distributed systems with causal ordering, integrity verification, and replay protection.
+**Spore Protocol v0.5** — a self-contained messaging protocol with causal ordering, authenticated message bodies, stable message IDs, and bounded parsing.
 
 Packages ("spores") carry not only a payload, but metadata to determine the message's place in a shared causal history.
 
@@ -16,7 +16,7 @@ The Spore protocol achieves this by wrapping a volatile payload (`payload`) with
 2. **Dual authentication:**
    - HMAC-SHA256 (shared group secret) — group membership verification.
    - Ed25519 (per-node key) — sender identity authentication, non-repudiation.
-3. **Deduplication:** A Bloom Filter to efficiently detect and drop previously seen messages.
+3. **Deduplication and anti-entropy:** Exact message history rejects repeats; Bloom is a probabilistic synchronization hint.
 4. **Transport encryption:** ChaCha20Poly1305 (AEAD).
 
 ---
@@ -25,13 +25,13 @@ The Spore protocol achieves this by wrapping a volatile payload (`payload`) with
 
 The `Spore` class is the primary interface for using the protocol. It handles packing payloads into a transmittable blob and unpacking blobs back into meaningful data.
 
-### 1. Bloom Filter (Replay Prevention + Anti-Entropy)
+### 1. Bloom Filter (Anti-Entropy Hint)
 
-*   **Function:** Provides a probabilistic check to determine if the compressed message body has been seen before. Also supports anti-entropy gossip via filter merging.
-*   **Operation:** Stores `blake2b(compressed).digest()` of each seen compressed blob.
+*   **Function:** Provides a probabilistic hint for anti-entropy gossip; exact replay prevention uses message history.
+*   **Operation:** Stores the raw 32-byte `blake2b(canonical_signed_body)` digest. Compression and envelope encoding do not affect a v0.5 ID.
 *   **`merge(peer_bloom)`**: Union of two Bloom filters for anti-entropy synchronization.
-*   **`get_missing_ids(peer_bloom)`**: Bloom-based compatibility check; false positives are possible.
-*   **Exact inventory:** `get_inventory()` and `get_missing_from_inventory(peer_inventory)` compare retained message IDs without Bloom false positives.
+*   **`get_missing_ids(peer_bloom)`**: Returns local IDs the peer's Bloom probably lacks (local minus peer); false positives can hide a missing ID.
+*   **Exact inventory:** `get_inventory()` lists local IDs; `get_missing_from_inventory(peer_inventory)` returns peer IDs absent locally (peer minus local), without Bloom false positives.
 *   **Note:** Like all Bloom Filters, it can produce false positives but no false negatives.
 
 ### 2. Vector Clock (Causal Ordering)
@@ -39,6 +39,7 @@ The `Spore` class is the primary interface for using the protocol. It handles pa
 *   **Function:** Tracks the history of updates. It consists of a map where each node ID holds an integer counter.
 *   **`tick()` (Sender Side):** Increments the sender's unbounded Python integer counter, creating a new causal history for the message.
 *   **`merge()` (Receiver Side):** Merges incoming counters component-wise. Legacy `e` epoch fields are ignored.
+*   **Bound:** Incoming clocks are limited to 4,096 node entries; local clocks remain unbounded integers.
 *   **`happens_before(other)`:** Returns True if this event causally precedes `other` (self → other).
 *   **`is_concurrent_with(other)`:** Returns True if events are concurrent (neither happens-before the other).
 
@@ -59,25 +60,24 @@ The `Spore` class is the primary interface for using the protocol. It handles pa
 
 ### 📦 `Spore.pack(payload) -> (compressed_bytes, message_id)`
 
-1. **Payload encapsulation:** Wraps payload with causal metadata (`VectorClock.tick()`), timestamp, and `host_id`.
-2. **Serialization:** Body is JSON serialized with sorted keys (deterministic).
-3. **Signing:** Body is HMAC-signed with group secret, then Ed25519-signed with node private key.
-4. **Envelope:** `{b: base64(body), g: hmac_sig, n: ed25519_sig, node_pubkey: pub}`.
-5. **Compaction:** Envelope compressed using `zlib` level 6.
-6. **Bloom update:** Compressed blob hash added to Bloom Filter and message history set.
-7. **Output:** Returns `(compressed_blob, message_id)`.
+1. **Payload encapsulation:** Adds protocol version, fresh 128-bit nonce, causal metadata, timestamp, and `host_id`.
+2. **Canonical body:** JSON uses sorted keys, compact separators, UTF-8, and rejects non-finite numbers.
+3. **Stable ID:** `blake2b(body_bytes, digest_size=32)`; the ID is based on the exact body bytes that are signed.
+4. **Signing:** Body is HMAC-signed with group secret and Ed25519-signed with node private key.
+5. **Envelope and compression:** `{b: base64(body), g: hmac_sig, n: ed25519_sig, node_pubkey: pub}`, then zlib level 6.
+6. **History:** Bloom receives raw digest bytes; the exact history retains the hex form for JSON/API compatibility.
+7. **Output:** Returns `(compressed_blob, 64-character hex message_id as bytes)`.
 
-### 📦 `Spore.unpack(raw) -> dict | None | {"__poison__": ...}`
+### 📦 `Spore.unpack(raw, expected_msg_id=None) -> dict | None | {"__poison__": ...}`
 
-1. **`msg_id = blake2b(raw).hexdigest()`**
-2. **Exact replay check:** If `msg_id` in `message_history` → `None`.
-3. **Decompression:** `zlib.decompress(raw)`.
-4. **Deserialization:** Parse blob to get `body_b64`, `group_sig`, `node_sig`, `node_pubkey`.
-5. **Group verification:** HMAC verify body with group secret. On fail → `{"__poison__": ..., "reason": "invalid_group_signature"}`.
-6. **Node verification:** Ed25519 verify body with signature and `node_pubkey`. On fail → `{"__poison__": ..., "reason": "invalid_node_signature"}`.
-7. **Record:** Only after successful verification — `bloom.add(raw)`, `message_history.add(msg_id)`.
-8. **Causal merge:** Merge incoming `VectorClock` into local clock.
-9. **Output:** Returns the application payload body.
+1. Enforces compressed and decompressed size limits (defaults: 1 MiB and 4 MiB).
+2. Parses and validates envelope/body types, strict base64, protocol version, nonce, and clock bounds.
+3. Verifies HMAC, Ed25519 identity, and local membership authorization.
+4. If `expected_msg_id` is supplied, compares it to the verified body ID before integration.
+5. Rejects exact replays; records the digest and merges the vector clock only after verification.
+6. Returns the verified body, `None` for malformed/replayed input, or a structured `__poison__` marker for failed authentication/ID checks.
+
+v0.4 messages without a protocol version remain readable using their legacy compressed-envelope ID. v0.5 IDs are stable across recompression; v0.4 IDs are not.
 
 ---
 
@@ -143,7 +143,7 @@ recovered = gossip_bob.request_missing(
     "spore", missing, "node-alpha", peer_transport=gossip_alice
 )
 for msg_id, payload in recovered.items():
-    result = bob.unpack(payload)  # verifies before integrating
+    result = bob.unpack(payload, expected_msg_id=msg_id)  # verifies ID before integrating
 ```
 
 ---
@@ -165,7 +165,8 @@ for msg_id, payload in recovered.items():
 
 ## 🏷️ Versions
 
-*   **v0.4** (current): Vector Clock ordering, Ed25519 identity, Bloom anti-entropy, ChaCha20Poly1305 encryption, HMAC group membership.
+*   **v0.5** (current): Nonce-bound stable body IDs, bounded parsing, verified recovery IDs, Vector Clock ordering, Ed25519 identity, Bloom anti-entropy, ChaCha20Poly1305 encryption, HMAC group membership.
+*   **v0.4** (legacy-readable): Shared HMAC + Ed25519, causal metadata, compressed-envelope IDs.
 *   v0.3 (original): Shared HMAC only, no causal ordering, no Ed25519, with tls_jitter simulation.
 
 ---

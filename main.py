@@ -1,5 +1,5 @@
 """
-Spore Protocol v0.4 (Enhanced)
+Spore Protocol v0.5 (Causal Replication foundation)
 
 This protocol provides a distributed messaging system with:
 - Vector clocks for causal ordering and concurrency detection
@@ -25,6 +25,52 @@ from nacl.signing import SigningKey, VerifyKey
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 SPORE_AAD = b"spore-v0.4-enriched"
+SPORE_PROTOCOL_VERSION = 5
+MAX_COMPRESSED_SPORE_BYTES = 1 * 1024 * 1024
+MAX_DECOMPRESSED_SPORE_BYTES = 4 * 1024 * 1024
+MAX_VECTOR_CLOCK_ENTRIES = 4096
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    """Serialize protocol data deterministically for signing and message IDs."""
+    return json.dumps(
+        value,
+        separators=(",", ":"),
+        sort_keys=True,
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _decompress_bounded(data: bytes, max_output_bytes: int) -> Optional[bytes]:
+    """Decompress one complete zlib stream without allowing output past the cap."""
+    try:
+        decoder = zlib.decompressobj()
+        output = decoder.decompress(data, max_output_bytes + 1)
+    except (zlib.error, ValueError, OverflowError):
+        return None
+    if (
+        len(output) > max_output_bytes
+        or decoder.unconsumed_tail
+        or decoder.unused_data
+        or not decoder.eof
+    ):
+        return None
+    return output
+
+
+def _normalize_message_id(value: Union[str, bytes]) -> Optional[bytes]:
+    """Normalize the public hex ID or a raw 32-byte digest to digest bytes."""
+    if isinstance(value, bytes) and len(value) == 32:
+        return value
+    try:
+        text_value = value.decode("ascii") if isinstance(value, bytes) else value
+        if not isinstance(text_value, str) or len(text_value) != 64:
+            return None
+        digest = bytes.fromhex(text_value)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return digest if len(digest) == 32 else None
 
 # ───────────────────────── Optional Gossip Transport ─────────────────────────
 
@@ -216,7 +262,13 @@ class VectorClock:
 # ───────────────────────── Spore core ─────────────────────────
 class Spore:
     def __init__(self, host_id: str, group_secret: bytes, private_key: str = "", public_key: str = "",
-                 history_file: Optional[str] = None, max_history_size: int = 10000):
+                 history_file: Optional[str] = None, max_history_size: int = 10000,
+                 max_compressed_size: int = MAX_COMPRESSED_SPORE_BYTES,
+                 max_decompressed_size: int = MAX_DECOMPRESSED_SPORE_BYTES):
+        if max_history_size <= 0:
+            raise ValueError("max_history_size must be positive")
+        if max_compressed_size <= 0 or max_decompressed_size <= 0:
+            raise ValueError("message size limits must be positive")
         self.host_id = host_id
         self.group_secret = group_secret
         self.bloom = BloomFilter()
@@ -241,6 +293,8 @@ class Spore:
         # Persistent replay history
         self.history_file = history_file
         self.max_history_size = max_history_size
+        self.max_compressed_size = max_compressed_size
+        self.max_decompressed_size = max_decompressed_size
         self._load_history()
 
     def _load_history(self) -> None:
@@ -322,16 +376,27 @@ class Spore:
     def pack(self, payload: Dict[str, Any]) -> Tuple[bytes, bytes]:
         """Pack payload with causal metadata, group HMAC, and node Ed25519 signature.
 
-        Returns: (compressed_spore, message_id)
+        Returns: (compressed_spore, 64-character hex message ID as bytes).
         """
-        # Signed body: does NOT include the public key (it lives in the envelope)
+        if not isinstance(payload, dict):
+            raise TypeError("payload must be a dictionary")
+        if len(self.clock.vec) > MAX_VECTOR_CLOCK_ENTRIES or (
+            self.host_id not in self.clock.vec
+            and len(self.clock.vec) >= MAX_VECTOR_CLOCK_ENTRIES
+        ):
+            raise ValueError("local vector clock exceeds configured entry limit")
+        # The nonce is part of the signed body and makes each message ID unique.
         body = {
+            "pv": SPORE_PROTOCOL_VERSION,
+            "nonce": secrets.token_hex(16),
             "p": payload,
             "t": int(time.time()),
             "n": self.host_id,
             "vc": self.clock.tick(),
         }
-        body_bytes = json.dumps(body, separators=(",", ":"), sort_keys=True).encode()
+        body_bytes = _canonical_json_bytes(body)
+        message_id_bytes = hashlib.blake2b(body_bytes, digest_size=32).digest()
+        message_id = message_id_bytes.hex()
         group_sig = self._sign_group(body_bytes)
         node_sig = self._sign_node(body_bytes)
 
@@ -343,87 +408,149 @@ class Spore:
             "node_pubkey": self.public_key,
         }
         raw = json.dumps(blob, separators=(",", ":")).encode()
+        if len(raw) > self.max_decompressed_size:
+            raise ValueError("Spore envelope exceeds configured decompressed size limit")
         compressed = zlib.compress(raw, level=6)
+        if len(compressed) > self.max_compressed_size:
+            raise ValueError("compressed Spore exceeds configured size limit")
 
-        # Use the canonical message-ID bytes in Bloom and exact inventory.
-        msg_id = hashlib.blake2b(compressed).hexdigest()
-        self.bloom.add(bytes.fromhex(msg_id))
-        self.message_history[msg_id] = time.time()
-        self._prune_history()
-        self._save_history()
-
-        # Optional AEAD encryption: if this node has a key, wrap the compressed blob
+        # Encrypt before recording locally so a key/configuration error leaves no phantom ID.
         if self.encryption_key:
             compressed = encrypt_spore(compressed, self.encryption_key)
 
-        return compressed, msg_id.encode()
+        # Keep hex in history for JSON/API compatibility; Bloom uses raw digest bytes.
+        self.bloom.add(message_id_bytes)
+        self.message_history[message_id] = time.time()
+        self._prune_history()
+        self._save_history()
 
-    def unpack(self, raw: bytes) -> Optional[Dict[str, Any]]:
-        # Optional AEAD decryption: if we have a key, try to unwrap first
+        return compressed, message_id.encode("ascii")
+
+    def unpack(
+        self,
+        raw: bytes,
+        expected_msg_id: Optional[Union[str, bytes]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Verify and unpack a message, optionally checking an anti-entropy ID."""
+        if not isinstance(raw, bytes):
+            return None
+        wire_limit = self.max_compressed_size + (28 if self.encryption_key else 0)
+        if len(raw) > wire_limit:
+            return None
+
+        # Optional AEAD decryption: if this node has a key, try to unwrap first.
         if self.encryption_key:
             decrypted = decrypt_spore(raw, self.encryption_key)
             if decrypted is None:
                 return None
             raw = decrypted
-
-        msg_id = hashlib.blake2b(raw).hexdigest()
-
-        # Exact replay detection via message ID set (computed on plaintext, matching pack)
-        if msg_id in self.message_history:
-            return None  # replay detected
-
-        # Decompress
-        try:
-            decompressed = zlib.decompress(raw)
-        except zlib.error:
+        if len(raw) > self.max_compressed_size:
             return None
 
-        # Parse blob
+        # Bound decompression before parsing an untrusted envelope.
+        decompressed = _decompress_bounded(raw, self.max_decompressed_size)
+        if decompressed is None:
+            return None
         try:
-            blob = json.loads(decompressed.decode())
-        except (json.JSONDecodeError, UnicodeDecodeError):
+            blob = json.loads(decompressed.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+            return None
+        if not isinstance(blob, dict):
             return None
 
-        body_b64 = blob.get("b", "")
-        group_sig = blob.get("g", "")
-        node_sig = blob.get("n", "")
-        node_pubkey = blob.get("node_pubkey", "")
-        if not isinstance(body_b64, str) or not group_sig or not node_sig:
+        body_b64 = blob.get("b")
+        group_sig = blob.get("g")
+        node_sig = blob.get("n")
+        node_pubkey = blob.get("node_pubkey")
+        if not all(isinstance(value, str) for value in (body_b64, group_sig, node_sig, node_pubkey)):
             return None
-
         try:
-            body_bytes = base64.b64decode(body_b64)
+            body_bytes = base64.b64decode(body_b64, validate=True)
+            body = json.loads(body_bytes.decode("utf-8"))
         except Exception:
             return None
+        if not isinstance(body, dict):
+            return None
 
-        # Try to decode body for host_id (safe: signatures are verified below)
+        if "pv" not in body:
+            # v0.4 compatibility: old messages had no protocol-version field.
+            message_id_bytes = hashlib.blake2b(raw, digest_size=32).digest()
+        elif type(body["pv"]) is int and body["pv"] == SPORE_PROTOCOL_VERSION:
+            nonce = body.get("nonce")
+            if not isinstance(nonce, str) or len(nonce) != 32:
+                return None
+            try:
+                if len(bytes.fromhex(nonce)) != 16 or _canonical_json_bytes(body) != body_bytes:
+                    return None
+            except (ValueError, TypeError, RecursionError):
+                return None
+            message_id_bytes = hashlib.blake2b(body_bytes, digest_size=32).digest()
+        else:
+            return None
+
+        # Validate structure and clock bounds before merging any untrusted state.
+        host_id = body.get("n")
+        payload = body.get("p")
+        timestamp = body.get("t")
+        vector_clock = body.get("vc")
+        if (
+            not isinstance(host_id, str)
+            or not host_id
+            or len(host_id) > 256
+            or not isinstance(payload, dict)
+            or type(timestamp) is not int
+            or not isinstance(vector_clock, dict)
+        ):
+            return None
+        clock_values = vector_clock.get("v", vector_clock.get("vec", {}))
+        if not isinstance(clock_values, dict) or len(clock_values) > MAX_VECTOR_CLOCK_ENTRIES:
+            return None
+        for node, counter in clock_values.items():
+            if (
+                not isinstance(node, str)
+                or not node
+                or len(node) > 256
+                or type(counter) is not int
+                or counter < 0
+            ):
+                return None
+
+        # Authenticate before trusting the sender identity or recording the ID.
         try:
-            body = json.loads(body_bytes.decode())
-            host_id = body.get("n", "?")
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            host_id = "?"
-
-        # Verify group membership (HMAC)
+            if (
+                len(group_sig) != 32
+                or len(bytes.fromhex(group_sig)) != 16
+                or len(node_sig) != 128
+                or len(bytes.fromhex(node_sig)) != 64
+                or len(node_pubkey) != 64
+                or len(bytes.fromhex(node_pubkey)) != 32
+            ):
+                return None
+        except ValueError:
+            return None
         if not self._verify_group(body_bytes, group_sig):
-            return {"__poison__": True, "from": host_id, "reason": "invalid_group_signature"}
-
-        # Verify node identity (Ed25519)
+            return {"__poison__": True, "reason": "invalid_group_signature"}
         if not self._verify_node(body_bytes, node_sig, node_pubkey):
-            return {"__poison__": True, "from": host_id, "reason": "invalid_node_signature"}
-
-        # Optional: verify the node is an authorized member of this swarm
+            return {"__poison__": True, "reason": "invalid_node_signature"}
         if not self.is_member(node_pubkey):
-            return {"__poison__": True, "from": host_id, "reason": "unauthorized_member"}
+            return {"__poison__": True, "reason": "unauthorized_member"}
         if self.swarm_members.get(node_pubkey) != host_id:
-            return {"__poison__": True, "from": host_id, "reason": "host_id_mismatch"}
+            return {"__poison__": True, "reason": "host_id_mismatch"}
 
-        # Only mark as seen after successful verification
-        self.bloom.add(bytes.fromhex(msg_id))
-        self.message_history[msg_id] = time.time()
+        message_id = message_id_bytes.hex()
+        if expected_msg_id is not None:
+            expected_digest = _normalize_message_id(expected_msg_id)
+            if expected_digest is None or not hmac.compare_digest(message_id_bytes, expected_digest):
+                return {"__poison__": True, "reason": "message_id_mismatch"}
+        if message_id in self.message_history:
+            return None
+
+        # Only mark as seen after authentication and expected-ID verification.
+        self.bloom.add(message_id_bytes)
+        self.message_history[message_id] = time.time()
         self._prune_history()
         self._save_history()
-
-        self.clock.merge(body.get("vc", {}))
+        self.clock.merge(vector_clock)
         return body
 
     def merge_bloom_filter(self, peer_bloom: BloomFilter) -> None:
@@ -431,12 +558,11 @@ class Spore:
         self.bloom = self.bloom.merge(peer_bloom)
 
     def get_missing_ids(self, peer_bloom: BloomFilter) -> Set[str]:
-        """Get message IDs that peer might have but we don't.
+        """Return local message IDs that the peer Bloom filter likely lacks.
 
-        This implements anti-entropy gossip.
-        The Bloom filter stores blake2b(compressed).digest() (raw bytes),
-        and msg_id is the hex of that same digest, so bytes.fromhex(msg_id)
-        is the exact same bytes the Bloom filter was built with.
+        This is the local-minus-peer direction and is probabilistic.
+        Bloom stores the raw digest of the canonical signed body; public IDs
+        remain 64-character hex strings for API and JSON-history compatibility.
         """
         missing = set()
         for msg_id in self.message_history.keys():
@@ -623,7 +749,7 @@ class SwarmTrace:
                     self.payloads.pop(msg_id, None)
 
     def get_missing_ids(self, peer_bloom: BloomFilter) -> Set[str]:
-        """Return msg_ids that peer_bloom indicates we may have missed."""
+        """Return local trace IDs that the peer Bloom filter likely lacks."""
         missing = set()
         with self._lock:
             for (msg_id, tag) in self.adds:
@@ -841,7 +967,7 @@ if __name__ == "__main__":
         print("fake message empty, cannot test tampering")
 
     # Full anti-entropy cycle: request → transfer → verify → integrate
-    # Spore-level: compare our message_history against peer's Bloom filter
+    # Spore-level: compare exact inventories before requesting missing messages.
     missing = bob.get_missing_from_inventory(alice.get_inventory())
     print("missing ids:", missing)
 
@@ -850,7 +976,7 @@ if __name__ == "__main__":
 
     # Verify and integrate recovered messages
     for msg_id, payload in recovered.items():
-        result = bob.unpack(payload)
+        result = bob.unpack(payload, expected_msg_id=msg_id)
         print(f"unpack {msg_id[:8]}...: {result}")
         if result and isinstance(result, dict) and not result.get("__poison__"):
             print(f"integrated {msg_id[:8]}...: {result.get('p')}")
