@@ -123,16 +123,28 @@ class BloomFilter:
         return merged
 
     def to_bits(self) -> List[bool]:
-        """Convert to list of bits for serialization."""
-        return [bool(self.bits[i] & (1 << i)) for i in range(self.size)]
+        """Convert to list of bits (len == size) for exact serialization/transport."""
+        bits = [False] * self.size
+        for byte_idx, byte_val in enumerate(self.bits):
+            if byte_val == 0:
+                continue
+            base = byte_idx << 3
+            for b in range(8):
+                pos = base + b
+                if pos >= self.size:
+                    break
+                bits[pos] = bool(byte_val & (1 << b))
+        return bits
 
     @classmethod
     def from_bits(cls, bits: List[bool], size: int = 2**18, k: int = 4) -> BloomFilter:
-        """Create BloomFilter from bits."""
+        """Reconstruct BloomFilter from bit list produced by to_bits()."""
         instance = cls(size=size, k=k)
-        for i, bit in enumerate(bits):
-            if i < (size >> 3):
-                instance.bits[i] = 1 if bit else 0
+        for pos, bit in enumerate(bits[:size]):
+            if bit:
+                byte_idx = pos >> 3
+                bit_idx = pos & 7
+                instance.bits[byte_idx] |= 1 << bit_idx
         return instance
 
 
@@ -162,10 +174,25 @@ class VectorClock:
         return False
 
     def happens_before(self, other: VectorClock) -> bool:
-        """Return True if this event causally precedes other's event (this -> other)."""
-        if self.node_id == other.node_id:
-            return self.vec.get(self.node_id, 0) < other.vec.get(self.node_id, 0)
-        return all(self.vec.get(k, 0) <= other.vec.get(k, 0) for k in set(self.vec) | set(other.vec))
+        """Return True if this event causally precedes other's event (this -> other).
+
+        Strict vector-clock comparison with epoch awareness:
+        - self.epoch must be <= other.epoch (a clock in a newer epoch cannot precede an older one)
+        - every component of self must be <= the matching component of other
+        - at least one component must be strictly less (strictly-before, not equal)
+        """
+        if self.epoch > other.epoch:
+            return False
+        at_least_one_strict = False
+        all_keys = set(self.vec) | set(other.vec)
+        for k in all_keys:
+            sv = self.vec.get(k, 0)
+            ov = other.vec.get(k, 0)
+            if sv > ov:
+                return False
+            if sv < ov:
+                at_least_one_strict = True
+        return at_least_one_strict
 
     def is_concurrent_with(self, other: VectorClock) -> bool:
         """Return True if this and other are concurrent events (self || other)."""
@@ -193,7 +220,8 @@ class VectorClock:
 
 # ───────────────────────── Spore core ─────────────────────────
 class Spore:
-    def __init__(self, host_id: str, group_secret: bytes, private_key: str = "", public_key: str = ""):
+    def __init__(self, host_id: str, group_secret: bytes, private_key: str = "", public_key: str = "",
+                 history_file: Optional[str] = None, max_history_size: int = 10000):
         self.host_id = host_id
         self.group_secret = group_secret
         self.bloom = BloomFilter()
@@ -206,8 +234,62 @@ class Spore:
         else:
             self.private_key, self.public_key = Ed25519KeyPair.generate()
 
-        # Set of seen message IDs (exact replay detection)
-        self.message_history: Set[str] = set()
+        # Set of seen message IDs (exact replay detection), mapped to timestamps for pruning
+        self.message_history: Dict[str, float] = {}
+
+        # Optional AEAD transport encryption key (bound to this node's swarm)
+        self.encryption_key: Optional[bytes] = None
+
+        # Swarm membership registry: public_key -> host_id (Ed25519 identity -> member)
+        self.swarm_members: Dict[str, str] = {}
+
+        # Persistent replay history
+        self.history_file = history_file
+        self.max_history_size = max_history_size
+        self._load_history()
+
+    def _load_history(self) -> None:
+        """Load replay message IDs from disk if a history file was provided."""
+        if not self.history_file:
+            return
+        try:
+            with open(self.history_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for msg_id, ts in data.items():
+                self.message_history[msg_id] = ts
+            # Trim to max size keeping newest entries
+            if len(self.message_history) > self.max_history_size:
+                newest = sorted(self.message_history.items(), key=lambda kv: kv[1], reverse=True)[:self.max_history_size]
+                self.message_history = dict(newest)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            # Start fresh if file is missing or corrupt
+            self.message_history = {}
+
+    def _save_history(self) -> None:
+        """Persist replay message IDs and timestamps to disk."""
+        if not self.history_file:
+            return
+        try:
+            with open(self.history_file, "w", encoding="utf-8") as f:
+                json.dump(self.message_history, f)
+        except OSError:
+            pass
+
+    def _prune_history(self) -> None:
+        """Remove oldest entries if message history exceeds max size."""
+        if len(self.message_history) <= self.max_history_size:
+            return
+        # Keep newest entries based on timestamp
+        newest = sorted(self.message_history.items(), key=lambda kv: kv[1], reverse=True)[: self.max_history_size]
+        self.message_history = dict(newest)
+
+    def authorize_member(self, public_key: str, host_id: str) -> None:
+        """Register a node's Ed25519 public key as an authorized member of this swarm."""
+        self.swarm_members[public_key] = host_id
+
+    def set_encryption_key(self, key: bytes) -> None:
+        """Set the optional AEAD encryption key for this Spore instance."""
+        self.encryption_key = key
 
     def _sign_group(self, payload: bytes) -> str:
         """Sign payload using HMAC-SHA256 for group membership verification."""
@@ -257,7 +339,13 @@ class Spore:
         # Use hash of compressed data for Bloom filter
         msg_id = hashlib.blake2b(compressed).hexdigest()
         self.bloom.add(compressed)
-        self.message_history.add(msg_id)
+        self.message_history[msg_id] = time.time()
+        self._prune_history()
+        self._save_history()
+
+        # Optional AEAD encryption: if this node has a key, wrap the compressed blob
+        if self.encryption_key:
+            compressed = encrypt_spore(compressed, self.encryption_key)
 
         return compressed, msg_id.encode()
 
@@ -267,6 +355,13 @@ class Spore:
         # Exact replay detection via message ID set
         if msg_id in self.message_history:
             return None  # replay detected
+
+        # Optional AEAD decryption: if we have a key, try to unwrap first
+        if self.encryption_key:
+            decrypted = decrypt_spore(raw, self.encryption_key)
+            if decrypted is None:
+                return None
+            raw = decrypted
 
         # Decompress
         try:
@@ -300,9 +395,16 @@ class Spore:
         if not self._verify_node(body_bytes, node_sig, node_pubkey):
             return {"__poison__": True, "from": blob.get("n", "?"), "reason": "invalid_node_signature"}
 
+        # Optional: verify the node is an authorized member of this swarm
+        if node_pubkey and node_pubkey in self.swarm_members:
+            if self.swarm_members[node_pubkey] != blob.get("n", ""):
+                return {"__poison__": True, "from": blob.get("n", "?"), "reason": "unauthorized_member"}
+
         # Only mark as seen after successful verification
         self.bloom.add(raw)
-        self.message_history.add(msg_id)
+        self.message_history[msg_id] = time.time()
+        self._prune_history()
+        self._save_history()
 
         body = json.loads(body_bytes.decode())
         self.clock.merge(body.get("vc", {}))
@@ -321,7 +423,7 @@ class Spore:
         is the exact same bytes the Bloom filter was built with.
         """
         missing = set()
-        for msg_id in self.message_history:
+        for msg_id in self.message_history.keys():
             if not peer_bloom.check(bytes.fromhex(msg_id)):
                 missing.add(msg_id)
         return missing
@@ -444,9 +546,10 @@ class SwarmTrace:
         return pruned
 
     def merge(self, other: "SwarmTrace") -> None:
-        """CRDT-ish merge: union of entries, removal sets."""
+        """OR-Set merge: union of adds, union of removes, and do not resurrect removed keys."""
         for key, e in other.entries.items():
-            self.entries[key] = e
+            if key not in self.removed:
+                self.entries[key] = e
         self.removed |= other.removed
 
 
@@ -469,7 +572,8 @@ class GossipTransport:
     so the protocol can be exercised without a live libp2p stack.
     """
 
-    def __init__(self, node_id: str, topics: Optional[Set[str]] = None):
+    def __init__(self, node_id: str, topics: Optional[Set[str]] = None,
+                 host: Optional[Any] = None, gosssub: Optional[Any] = None):
         self.node_id = node_id
         self.topics = topics or set()
         self.peers: Set[str] = set()
@@ -477,24 +581,34 @@ class GossipTransport:
         self._gossip_enabled = LIBP2P_AVAILABLE
         self._lock = threading.RLock()
 
+        # libp2p integration (optional, injected for testability)
+        self._host = host
+        self._gossipsub = gosssub
+
     def subscribe(self, topic: str, handler: Any) -> None:
         with self._lock:
             self._listeners.setdefault(topic, []).append(handler)
             self.topics.add(topic)
-
-    def publish(self, topic: str, payload: bytes, sender_id: str, vector_clock: Dict[str, Any], message_id: str) -> None:
-        if not self._gossip_enabled:
-            # In-process gossip simulation
-            for handler in list(self._listeners.get(topic, [])):
+            # If libp2p is available and we have a host, subscribe to the topic
+            if self._gossip_enabled and self._gossipsub and self._host:
                 try:
-                    handler(GossipedMessage(topic, payload, sender_id, vector_clock, message_id))
+                    self._gossipsub.subscribe(topic)
                 except Exception:
                     pass
-            return
-        # Real GossipSub would publish here; for now, deliver locally via in-process fanout
+
+    def publish(self, topic: str, payload: bytes, sender_id: str, vector_clock: Dict[str, Any], message_id: str) -> None:
+        # Always deliver to local listeners (in-process)
         for handler in list(self._listeners.get(topic, [])):
             try:
                 handler(GossipedMessage(topic, payload, sender_id, vector_clock, message_id))
+            except Exception:
+                pass
+
+        # If libp2p GossipSub is available, publish to the network
+        if self._gossip_enabled and self._gossipsub:
+            try:
+                import asyncio
+                asyncio.create_task(self._gossipsub.publish(topic, payload))
             except Exception:
                 pass
 
