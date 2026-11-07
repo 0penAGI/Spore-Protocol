@@ -148,43 +148,32 @@ class BloomFilter:
         return instance
 
 
-# ───────────────────────── Vector clock + epoch ─────────────────────────
+# ───────────────────────── Vector clock ─────────────────────────
 class VectorClock:
     def __init__(self, node_id: str):
         self.node_id = node_id
         self.vec: Dict[str, int] = {}
-        self.epoch: int = 0
-        self.CEILING: int = 2**48
 
-    def tick(self) -> Dict[str, int]:
+    def tick(self) -> Dict[str, Any]:
         self.vec[self.node_id] = self.vec.get(self.node_id, 0) + 1
-        if self.vec[self.node_id] >= self.CEILING:
-            self.epoch += 1
-            # Only reset the local counter; other nodes' counters are preserved
-            # so causal relationships across epoch boundaries remain intact.
-            self.vec[self.node_id] = 0
-        return {"e": self.epoch, "v": dict(self.vec)}
+        return {"v": dict(self.vec)}
 
     def merge(self, remote: Dict[str, Any]) -> bool:
-        remote_e = remote.get("e", 0)
-        if remote_e > self.epoch:
-            self.epoch = remote_e
-            self.vec = {}
-            return True
-        for k, v in remote.get("v", {}).items():
-            self.vec[k] = max(self.vec.get(k, 0), v)
-        return False
+        """Merge counters component-wise; legacy epoch fields are ignored."""
+        changed = False
+        remote_vec = remote.get("v", remote.get("vec", {}))
+        if not isinstance(remote_vec, dict):
+            return False
+        for k, v in remote_vec.items():
+            if type(v) is not int or v < 0:
+                continue
+            if v > self.vec.get(k, 0):
+                self.vec[k] = v
+                changed = True
+        return changed
 
     def happens_before(self, other: VectorClock) -> bool:
-        """Return True if this event causally precedes other's event (this -> other).
-
-        Strict vector-clock comparison with epoch awareness:
-        - self.epoch must be <= other.epoch (a clock in a newer epoch cannot precede an older one)
-        - every component of self must be <= the matching component of other
-        - at least one component must be strictly less (strictly-before, not equal)
-        """
-        if self.epoch > other.epoch:
-            return False
+        """Return True if this event causally precedes other's event (this -> other)."""
         at_least_one_strict = False
         all_keys = set(self.vec) | set(other.vec)
         for k in all_keys:
@@ -198,26 +187,30 @@ class VectorClock:
 
     def is_concurrent_with(self, other: VectorClock) -> bool:
         """Return True if this and other are concurrent events (self || other)."""
-        return not self.happens_before(other) and not other.happens_before(self)
+        return (
+            not self.happens_before(other)
+            and not other.happens_before(self)
+            and self.vec != other.vec
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dict representation for serialization."""
-        return {
-            "node_id": self.node_id,
-            "vec": dict(self.vec),
-            "epoch": self.epoch
-        }
+        return {"node_id": self.node_id, "vec": dict(self.vec)}
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> VectorClock:
         """Create VectorClock from dict representation."""
         instance = cls(data.get("node_id", ""))
-        instance.vec = data.get("vec", {})
-        instance.epoch = data.get("epoch", 0)
+        raw_vec = data.get("vec", data.get("v", {}))
+        if isinstance(raw_vec, dict):
+            instance.vec = {
+                node: counter for node, counter in raw_vec.items()
+                if isinstance(node, str) and type(counter) is int and counter >= 0
+            }
         return instance
 
     def __str__(self) -> str:
-        return f"VectorClock(node={self.node_id}, vec={self.vec}, epoch={self.epoch})"
+        return f"VectorClock(node={self.node_id}, vec={self.vec})"
 
 
 # ───────────────────────── Spore core ─────────────────────────
@@ -352,9 +345,9 @@ class Spore:
         raw = json.dumps(blob, separators=(",", ":")).encode()
         compressed = zlib.compress(raw, level=6)
 
-        # Use hash of compressed data for Bloom filter
+        # Use the canonical message-ID bytes in Bloom and exact inventory.
         msg_id = hashlib.blake2b(compressed).hexdigest()
-        self.bloom.add(compressed)
+        self.bloom.add(bytes.fromhex(msg_id))
         self.message_history[msg_id] = time.time()
         self._prune_history()
         self._save_history()
@@ -425,7 +418,7 @@ class Spore:
             return {"__poison__": True, "from": host_id, "reason": "host_id_mismatch"}
 
         # Only mark as seen after successful verification
-        self.bloom.add(raw)
+        self.bloom.add(bytes.fromhex(msg_id))
         self.message_history[msg_id] = time.time()
         self._prune_history()
         self._save_history()
@@ -450,6 +443,14 @@ class Spore:
             if not peer_bloom.check(bytes.fromhex(msg_id)):
                 missing.add(msg_id)
         return missing
+
+    def get_inventory(self) -> Set[str]:
+        """Return the exact set of message IDs retained in local history."""
+        return set(self.message_history)
+
+    def get_missing_from_inventory(self, peer_inventory: Set[str]) -> Set[str]:
+        """Return IDs present in the peer inventory but absent locally."""
+        return set(peer_inventory) - set(self.message_history)
 
     def __str__(self) -> str:
         return f"Spore(host_id={self.host_id}, node_pubkey={self.public_key[:16]}..., causal={self.clock.vec})"
@@ -493,27 +494,31 @@ class Pheromone:
 
     def tick(self) -> Dict[str, int]:
         self.vec[self.host_id] = self.vec.get(self.host_id, 0) + 1
-        if self.vec[self.host_id] >= self.CEILING:
-            self.epoch += 1
-            self.vec = {k: 0 for k in self.vec}
-        return {"e": self.epoch, "v": dict(self.vec)}
+        return {"v": dict(self.vec)}
 
     def merge(self, remote: Dict[str, Any]) -> bool:
-        remote_e = remote.get("e", 0)
-        if remote_e > self.epoch:
-            self.epoch = remote_e
-            self.vec = {}
-            return True
+        """Merge remote vector clock. Never destroys local causal history."""
+        changed = False
         for k, v in remote.get("v", {}).items():
-            self.vec[k] = max(self.vec.get(k, 0), v)
-        return False
+            if type(v) is not int or v < 0:
+                continue
+            if v > self.vec.get(k, 0):
+                self.vec[k] = v
+                changed = True
+        return changed
 
     def happens_before(self, other: Any) -> bool:
         if not isinstance(other, Pheromone):
             return False
-        if self.host_id == other.host_id:
-            return self.vec.get(self.host_id, 0) < other.vec.get(self.host_id, 0)
-        return all(self.vec.get(k, 0) <= other.vec.get(k, 0) for k in set(self.vec) | set(other.vec))
+        less = False
+        for key in set(self.vec) | set(other.vec):
+            left = self.vec.get(key, 0)
+            right = other.vec.get(key, 0)
+            if left > right:
+                return False
+            if left < right:
+                less = True
+        return less
 
     def is_concurrent_with(self, other: Any) -> bool:
         return not self.happens_before(other) and not getattr(other, "happens_before", lambda x: False)(self)
@@ -535,72 +540,98 @@ class SwarmTraceEntry:
 class SwarmTrace:
     """Trace manager: nodes write/read asynchronously, prune by TTL.
 
-    OR-Set style: entries keyed by (msg_id, tag); tag is unique per originating node.
+    Proper OR-Set: each add generates a unique tag; removes specify a tag to remove.
+    An element is present iff there exists an add with tag T such that T is not
+    in the removed set. Merge is union of adds and union of removed tags.
     """
-    entries: Dict[Tuple[str, str], SwarmTraceEntry] = field(default_factory=dict)
-    removed: Set[Tuple[str, str]] = field(default_factory=set)
+    adds: Dict[Tuple[str, str], SwarmTraceEntry] = field(default_factory=dict)
+    removed: Set[str] = field(default_factory=set)  # set of tags to remove
     ttl_seconds: float = 3600.0
     payloads: Dict[str, bytes] = field(default_factory=dict)
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
-    def add(self, msg_id: str, tag: str, vector_clock: Dict[str, Any]) -> None:
-        key = (msg_id, tag)
-        self.entries[key] = SwarmTraceEntry(
-            msg_id=msg_id, tag=tag, vector_clock=vector_clock, ttl_seconds=self.ttl_seconds
-        )
-        self.removed.discard(key)
-
-    def add_payload(self, msg_id: str, payload: bytes) -> None:
-        """Store a payload for later retrieval by missing-message requests."""
-        self.payloads[msg_id] = payload
-
-    def get_payload(self, msg_id: str) -> Optional[bytes]:
-        """Retrieve a stored payload."""
-        return self.payloads.get(msg_id)
-
-    def remove_payload(self, msg_id: str) -> None:
-        """Drop a stored payload."""
-        self.payloads.pop(msg_id, None)
+    def add(self, msg_id: str, tag: str, vector_clock: Dict[str, Any],
+            payload: Optional[bytes] = None) -> None:
+        """Add an element with a unique tag; removed tags can never be reused."""
+        with self._lock:
+            if tag in self.removed or any(existing_tag == tag for _, existing_tag in self.adds):
+                raise ValueError("Removed OR-Set tags cannot be reused")
+            key = (msg_id, tag)
+            self.adds[key] = SwarmTraceEntry(
+                msg_id=msg_id, tag=tag, vector_clock=vector_clock, ttl_seconds=self.ttl_seconds
+            )
+            if payload is not None:
+                self.payloads[msg_id] = payload
 
     def remove(self, msg_id: str, tag: str) -> None:
-        self.removed.add((msg_id, tag))
+        """Remove a tag. Concurrent add+remove on the same tag: remove wins."""
+        with self._lock:
+            self.removed.add(tag)
 
     def contains(self, msg_id: str) -> bool:
-        return any(e.msg_id == msg_id and (e.msg_id, e.tag) not in self.removed for e in self.entries.values())
+        with self._lock:
+            for (mid, tag) in self.adds:
+                if mid == msg_id and tag not in self.removed:
+                    return True
+            return False
+
+    def get_payload(self, msg_id: str) -> Optional[bytes]:
+        with self._lock:
+            return self.payloads.get(msg_id)
 
     def prune(self, now: Optional[float] = None) -> int:
         """Drop entries older than TTL. Returns number pruned."""
         now = time.time() if now is None else now
         pruned = 0
-        dead_keys = []
-        for key, e in self.entries.items():
-            if now - e.created_at > e.ttl_seconds:
-                dead_keys.append(key)
-                pruned += 1
-        for key in dead_keys:
-            self.entries.pop(key, None)
-            self.removed.add(key)
-            # Also drop payloads for pruned entries
-            self.payloads.pop(key[0], None)
+        with self._lock:
+            for key, entry in list(self.adds.items()):
+                if now - entry.created_at > entry.ttl_seconds:
+                    self.removed.add(entry.tag)
+                    del self.adds[key]
+                    pruned += 1
+            active_ids = {
+                msg_id for (msg_id, tag) in self.adds if tag not in self.removed
+            }
+            for msg_id in list(self.payloads):
+                if msg_id not in active_ids:
+                    self.payloads.pop(msg_id, None)
         return pruned
 
     def merge(self, other: "SwarmTrace") -> None:
-        """OR-Set merge with concurrent remove+add resolution.
+        """OR-Set merge: union of adds, union of removed tags.
 
-        - Adds from `other` are applied unless we have removed the same key
-          (self's remove wins on concurrent remove+add).
-        - Removes from `other` are applied to our entries if present.
-        - Payloads are unioned (last-write-wins by timestamp).
+        Concurrent remove+add on the same tag: the remove wins because the tag
+        ends up in the union of removed sets.
         """
-        for key, e in other.entries.items():
-            if key not in self.removed:
-                self.entries[key] = e
-        for key in other.removed:
-            if key in self.entries:
-                self.entries.pop(key, None)
-            self.removed.add(key)
-        # Merge payloads (union, last-write-wins by timestamp)
-        for msg_id, payload in other.payloads.items():
-            self.payloads[msg_id] = payload
+        with other._lock:
+            remote_adds = dict(other.adds)
+            remote_removed = set(other.removed)
+            remote_payloads = dict(other.payloads)
+        with self._lock:
+            self.removed |= remote_removed
+            for key, entry in remote_adds.items():
+                if key not in self.adds:
+                    self.adds[key] = entry
+            active_ids = {
+                msg_id for (msg_id, tag) in self.adds if tag not in self.removed
+            }
+            for msg_id, payload in remote_payloads.items():
+                if msg_id in active_ids:
+                    self.payloads.setdefault(msg_id, payload)
+            for msg_id in list(self.payloads):
+                if msg_id not in active_ids:
+                    self.payloads.pop(msg_id, None)
+
+    def get_missing_ids(self, peer_bloom: BloomFilter) -> Set[str]:
+        """Return msg_ids that peer_bloom indicates we may have missed."""
+        missing = set()
+        with self._lock:
+            for (msg_id, tag) in self.adds:
+                if tag in self.removed:
+                    continue
+                if not peer_bloom.check(bytes.fromhex(msg_id)):
+                    missing.add(msg_id)
+        return missing
 
 
 # ───────────────────────── GossipTransport (libp2p GossipSub + CRDT) ────────────────────
@@ -628,6 +659,7 @@ class GossipTransport:
         self.topics = topics or set()
         self.peers: Set[str] = set()
         self._listeners: Dict[str, List[Any]] = {}
+        self._payload_handlers: Dict[str, List[Any]] = {}
         self._gossip_enabled = LIBP2P_AVAILABLE
         self._lock = threading.RLock()
 
@@ -645,6 +677,11 @@ class GossipTransport:
                     self._gossipsub.subscribe(topic)
                 except Exception:
                     pass
+
+    def register_payload_provider(self, topic: str, handler: Any) -> None:
+        """Register a provider used only to retrieve payloads by message ID."""
+        with self._lock:
+            self._payload_handlers.setdefault(topic, []).append(handler)
 
     def publish(self, topic: str, payload: bytes, sender_id: str, vector_clock: Dict[str, Any], message_id: str) -> None:
         # Always deliver to local listeners (in-process)
@@ -676,6 +713,27 @@ class GossipTransport:
     def gossip_subscribe_and_publish(self, topic: str, payload: bytes, sender_id: str, vector_clock: Dict[str, Any], message_id: str) -> None:
         """Alias for publish to make GossipSub semantics explicit."""
         self.publish(topic, payload, sender_id, vector_clock, message_id)
+
+    def request_missing(self, topic: str, missing_ids: Set[str], peer_id: str,
+                    peer_transport: Optional["GossipTransport"] = None) -> Dict[str, bytes]:
+        """Full anti-entropy cycle: request → transfer → verify → integrate.
+
+        Returns dict of msg_id → payload received from the peer.
+        """
+        received: Dict[str, bytes] = {}
+        source = peer_transport or self
+        with source._lock:
+            handlers = list(source._payload_handlers.get(topic, []))
+        for msg_id in missing_ids:
+            for handler in handlers:
+                try:
+                    payload = handler(msg_id)
+                    if payload is not None:
+                        received[msg_id] = payload
+                        break
+                except Exception:
+                    continue
+        return received
 
     def start(self) -> None:
         """Start the transport: create libp2p host and GossipSub if available."""
@@ -741,28 +799,36 @@ if __name__ == "__main__":
     def on_message(msg: GossipedMessage) -> None:
         received[msg.message_id] = msg
 
+    def on_payload(msg_id: str) -> Optional[bytes]:
+        """Handler for anti-entropy payload requests."""
+        return trace_alice.get_payload(msg_id)
+
     gossip_bob.subscribe("spore", on_message)
+    gossip_alice.register_payload_provider("spore", on_payload)
 
     # Authorize members: each node must explicitly register the other's Ed25519 key
     alice.authorize_member(bob.public_key, "node-beta")
     bob.authorize_member(alice.public_key, "node-alpha")
 
-    spore, msg_id = alice.pack({"intent": "resonate", "phase": 0.7})
-    spore, msg_id = alice.pack({"intent": "grow", "phase": 0.9})
+    # Alice sends two messages via gossip
+    spore1, msg_id1 = alice.pack({"intent": "resonate", "phase": 0.7})
+    spore2, msg_id2 = alice.pack({"intent": "grow", "phase": 0.9})
 
-    alice.merge_bloom_filter(bob.bloom)
+    # Store payloads in SwarmTrace for anti-entropy recovery
+    trace_alice.add(msg_id1.decode(), "tag-" + msg_id1.decode(), pheromone_alice.tick(), payload=spore1)
+    trace_alice.add(msg_id2.decode(), "tag-" + msg_id2.decode(), pheromone_alice.tick(), payload=spore2)
 
     # Broadcast via gossip transport
     gossip_alice.gossip_subscribe_and_publish(
-        "spore", spore, sender_id="node-alpha", vector_clock=pheromone_alice.tick(), message_id=msg_id.decode()
+        "spore", spore2, sender_id="node-alpha", vector_clock=pheromone_alice.tick(), message_id=msg_id2.decode()
     )
 
-    # Bob unpacks via Spore
-    result = bob.unpack(spore)
+    # Bob receives and unpacks
+    result = bob.unpack(spore2)
     print("bob sees:", result)
 
     # Replay check via message ID
-    result2 = bob.unpack(spore)
+    result2 = bob.unpack(spore2)
     print("replay filtered:", result2)  # → None on replay
 
     # Poison detection for tampered messages
@@ -774,9 +840,23 @@ if __name__ == "__main__":
     else:
         print("fake message empty, cannot test tampering")
 
-    # SwarmTrace demo
-    trace_alice.add(msg_id.decode(), "tag-" + msg_id.decode(), pheromone_alice.tick())
-    trace_alice.remove(msg_id.decode(), "tag-" + msg_id.decode())
+    # Full anti-entropy cycle: request → transfer → verify → integrate
+    # Spore-level: compare our message_history against peer's Bloom filter
+    missing = bob.get_missing_from_inventory(alice.get_inventory())
+    print("missing ids:", missing)
+
+    recovered = gossip_bob.request_missing("spore", missing, "node-alpha", peer_transport=gossip_alice)
+    print("recovered payloads:", list(recovered.keys()))
+
+    # Verify and integrate recovered messages
+    for msg_id, payload in recovered.items():
+        result = bob.unpack(payload)
+        print(f"unpack {msg_id[:8]}...: {result}")
+        if result and isinstance(result, dict) and not result.get("__poison__"):
+            print(f"integrated {msg_id[:8]}...: {result.get('p')}")
+
+    # Merge SwarmTrace (OR-Set with concurrent remove+add resolution)
+    trace_alice.remove(msg_id1.decode(), "tag-" + msg_id1.decode())
     trace_bob.merge(trace_alice)
     pruned = trace_bob.prune()
 

@@ -30,14 +30,15 @@ The `Spore` class is the primary interface for using the protocol. It handles pa
 *   **Function:** Provides a probabilistic check to determine if the compressed message body has been seen before. Also supports anti-entropy gossip via filter merging.
 *   **Operation:** Stores `blake2b(compressed).digest()` of each seen compressed blob.
 *   **`merge(peer_bloom)`**: Union of two Bloom filters for anti-entropy synchronization.
-*   **`get_missing_ids(peer_bloom)`**: Returns message IDs the peer likely has but we do not.
+*   **`get_missing_ids(peer_bloom)`**: Bloom-based compatibility check; false positives are possible.
+*   **Exact inventory:** `get_inventory()` and `get_missing_from_inventory(peer_inventory)` compare retained message IDs without Bloom false positives.
 *   **Note:** Like all Bloom Filters, it can produce false positives but no false negatives.
 
 ### 2. Vector Clock (Causal Ordering)
 
 *   **Function:** Tracks the history of updates. It consists of a map where each node ID holds an integer counter.
-*   **`tick()` (Sender Side):** Increments the sender's counter, creating a new, unique causal history for the message.
-*   **`merge()` (Receiver Side):** Merges incoming Vector Clock into local clock.
+*   **`tick()` (Sender Side):** Increments the sender's unbounded Python integer counter, creating a new causal history for the message.
+*   **`merge()` (Receiver Side):** Merges incoming counters component-wise. Legacy `e` epoch fields are ignored.
 *   **`happens_before(other)`:** Returns True if this event causally precedes `other` (self → other).
 *   **`is_concurrent_with(other)`:** Returns True if events are concurrent (neither happens-before the other).
 
@@ -133,13 +134,16 @@ assert bob.unpack(decrypted) is None
 ## 🔄 Anti-Entropy (Gossip)
 
 ```python
-# Exchange Bloom filters between peers
-bob.merge_bloom_filter(alice.bloom)
+# Exchange exact inventories to avoid Bloom false positives
+missing = bob.get_missing_from_inventory(alice.get_inventory())
 
-# Request missing message IDs
-missing = bob.get_missing_ids(alice.bloom)
-# missing contains msg_id that alice likely has seen but bob hasn't
-# bob can request full packets from alice for those msg_id
+# Register payload retrieval separately from normal message delivery
+gossip_alice.register_payload_provider("spore", trace_alice.get_payload)
+recovered = gossip_bob.request_missing(
+    "spore", missing, "node-alpha", peer_transport=gossip_alice
+)
+for msg_id, payload in recovered.items():
+    result = bob.unpack(payload)  # verifies before integrating
 ```
 
 ---
@@ -151,7 +155,9 @@ missing = bob.get_missing_ids(alice.bloom)
 | `VectorClock` | Causal clocks with `happens_before` / `is_concurrent_with` |
 | `BloomFilter` | Probabilistic filter with `merge` / `get_missing_ids` |
 | `Ed25519KeyPair` | Ed25519 generation/signing/verification (PyNaCl) |
-| `Spore` | Main interface: `pack`, `unpack`, `merge_bloom_filter`, `get_missing_ids` |
+| `Spore` | Main interface: `pack`, `unpack`, exact inventory, Bloom compatibility methods |
+| `SwarmTrace` | TTL-backed OR-Set trace and payload store |
+| `GossipTransport` | Message delivery plus separate payload-provider registration |
 | `encrypt_spore` / `decrypt_spore` | AEAD encryption for transport |
 | `poison_on_tamper` | Transport HMAC tag (optional) |
 
