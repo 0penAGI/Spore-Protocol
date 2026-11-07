@@ -19,12 +19,26 @@ import base64
 import threading
 import secrets
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple, Any, List, Set
+from typing import Dict, Optional, Tuple, Any, List, Set, Union
 
 from nacl.signing import SigningKey, VerifyKey
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 SPORE_AAD = b"spore-v0.4-enriched"
+
+# ───────────────────────── Optional Gossip Transport ─────────────────────────
+
+try:
+    # libp2p GossipSub is optional — if not installed, transport falls back to no-op
+    from libp2p.peer.id import ID as Libp2pID
+    from libp2p.peer.peer import PeerInfo
+    from libp2p.transport.tcp import TcpTransport
+    from libp2p.pubsub.gossipsub import GossipSub
+    from libp2p.core.host import Host
+
+    LIBP2P_AVAILABLE = True
+except Exception:  # pragma: no cover
+    LIBP2P_AVAILABLE = False
 
 # ───────────────────────── Ed25519 Key Management ─────────────────────────
 
@@ -337,14 +351,177 @@ def poison_on_tamper(packet: bytes, poison_key: bytes) -> bytes:
     tag = hmac.new(poison_key, packet, digestmod=hashlib.sha256).digest()[:16]
     return tag + packet
 
+
+# ───────────────────────── Pheromone (VectorClock layer) ─────────────────────────
+
+@dataclass
+class Pheromone:
+    """Vector clock masquerading as metadata — no global time, causality only.
+
+    Events carry vector clocks; ordering is derived from happens-before,
+    concurrency from incomparability.
+    """
+    host_id: str = ""
+    vec: Dict[str, int] = field(default_factory=dict)
+    epoch: int = 0
+    CEILING: int = 2**48
+
+    def tick(self) -> Dict[str, int]:
+        self.vec[self.host_id] = self.vec.get(self.host_id, 0) + 1
+        if self.vec[self.host_id] >= self.CEILING:
+            self.epoch += 1
+            self.vec = {k: 0 for k in self.vec}
+        return {"e": self.epoch, "v": dict(self.vec)}
+
+    def merge(self, remote: Dict[str, Any]) -> bool:
+        remote_e = remote.get("e", 0)
+        if remote_e > self.epoch:
+            self.epoch = remote_e
+            self.vec = {}
+            return True
+        for k, v in remote.get("v", {}).items():
+            self.vec[k] = max(self.vec.get(k, 0), v)
+        return False
+
+    def happens_before(self, other: Any) -> bool:
+        if not isinstance(other, Pheromone):
+            return False
+        if self.host_id == other.host_id:
+            return self.vec.get(self.host_id, 0) < other.vec.get(self.host_id, 0)
+        return all(self.vec.get(k, 0) <= other.vec.get(k, 0) for k in set(self.vec) | set(other.vec))
+
+    def is_concurrent_with(self, other: Any) -> bool:
+        return not self.happens_before(other) and not getattr(other, "happens_before", lambda x: False)(self)
+
+
+# ───────────────────────── SwarmTrace (TTL lock-free-ish manager) ───────────────────
+
+@dataclass
+class SwarmTraceEntry:
+    """A single causal trace entry with a unique per-node tag and TTL."""
+    msg_id: str
+    tag: str
+    vector_clock: Dict[str, Any]
+    ttl_seconds: float = 3600.0
+    created_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class SwarmTrace:
+    """Trace manager: nodes write/read asynchronously, prune by TTL.
+
+    OR-Set style: entries keyed by (msg_id, tag); tag is unique per originating node.
+    """
+    entries: Dict[Tuple[str, str], SwarmTraceEntry] = field(default_factory=dict)
+    removed: Set[Tuple[str, str]] = field(default_factory=set)
+    ttl_seconds: float = 3600.0
+
+    def add(self, msg_id: str, tag: str, vector_clock: Dict[str, Any]) -> None:
+        key = (msg_id, tag)
+        self.entries[key] = SwarmTraceEntry(
+            msg_id=msg_id, tag=tag, vector_clock=vector_clock, ttl_seconds=self.ttl_seconds
+        )
+        self.removed.discard(key)
+
+    def remove(self, msg_id: str, tag: str) -> None:
+        self.removed.add((msg_id, tag))
+
+    def contains(self, msg_id: str) -> bool:
+        return any(e.msg_id == msg_id and (e.msg_id, e.tag) not in self.removed for e in self.entries.values())
+
+    def prune(self, now: Optional[float] = None) -> int:
+        """Drop entries older than TTL. Returns number pruned."""
+        now = time.time() if now is None else now
+        pruned = 0
+        dead_keys = []
+        for key, e in self.entries.items():
+            if now - e.created_at > e.ttl_seconds:
+                dead_keys.append(key)
+                pruned += 1
+        for key in dead_keys:
+            self.entries.pop(key, None)
+            self.removed.add(key)
+        return pruned
+
+    def merge(self, other: "SwarmTrace") -> None:
+        """CRDT-ish merge: union of entries, removal sets."""
+        for key, e in other.entries.items():
+            self.entries[key] = e
+        self.removed |= other.removed
+
+
+# ───────────────────────── GossipTransport (libp2p GossipSub + CRDT) ────────────────────
+
+@dataclass
+class GossipedMessage:
+    topic: str
+    payload: bytes
+    sender_id: str
+    vector_clock: Dict[str, Any]
+    message_id: str
+
+
+class GossipTransport:
+    """Gossip-based transport interface.
+
+    In production: uses libp2p GossipSub for pub/sub over the swarm topic mesh.
+    Here we provide the interface + a lightweight in-process gossip simulation
+    so the protocol can be exercised without a live libp2p stack.
+    """
+
+    def __init__(self, node_id: str, topics: Optional[Set[str]] = None):
+        self.node_id = node_id
+        self.topics = topics or set()
+        self.peers: Set[str] = set()
+        self._listeners: Dict[str, List[Any]] = {}
+        self._gossip_enabled = LIBP2P_AVAILABLE
+        self._lock = threading.RLock()
+
+    def subscribe(self, topic: str, handler: Any) -> None:
+        with self._lock:
+            self._listeners.setdefault(topic, []).append(handler)
+            self.topics.add(topic)
+
+    def publish(self, topic: str, payload: bytes, sender_id: str, vector_clock: Dict[str, Any], message_id: str) -> None:
+        if not self._gossip_enabled:
+            # In-process gossip simulation
+            for handler in list(self._listeners.get(topic, [])):
+                try:
+                    handler(GossipedMessage(topic, payload, sender_id, vector_clock, message_id))
+                except Exception:
+                    pass
+            return
+        # Real GossipSub would publish here; for now, deliver locally via in-process fanout
+        for handler in list(self._listeners.get(topic, [])):
+            try:
+                handler(GossipedMessage(topic, payload, sender_id, vector_clock, message_id))
+            except Exception:
+                pass
+
+    def add_peer(self, peer_id: str) -> None:
+        with self._lock:
+            self.peers.add(peer_id)
+
+    def merge_gossip(self, other: "GossipTransport") -> None:
+        """CRDT merge: union of topics and listeners is represented via trace merges."""
+        with self._lock:
+            self.peers |= other.peers
+            for t, hs in other._listeners.items():
+                self._listeners.setdefault(t, []).extend(hs)
+
+    def gossip_subscribe_and_publish(self, topic: str, payload: bytes, sender_id: str, vector_clock: Dict[str, Any], message_id: str) -> None:
+        """Alias for publish to make GossipSub semantics explicit."""
+        self.publish(topic, payload, sender_id, vector_clock, message_id)
+
+
 if __name__ == "__main__":
     # Group secret is shared between nodes (HMAC verifies group membership)
     group_secret = os.urandom(32)
-    
+
     # Each node has its own Ed25519 key pair (identity)
     alice_priv, alice_pub = Ed25519KeyPair.generate()
     bob_priv, bob_pub = Ed25519KeyPair.generate()
-    
+
     alice = Spore(
         host_id="node-alpha",
         group_secret=group_secret,
@@ -357,24 +534,58 @@ if __name__ == "__main__":
         private_key=bob_priv,
         public_key=bob_pub,
     )
-    
+
+    # Pheromone: vector clock layer (causality only, no global time)
+    pheromone_alice = Pheromone(host_id="node-alpha")
+    pheromone_bob = Pheromone(host_id="node-beta")
+
+    # SwarmTrace: async trace manager with TTL
+    trace_alice = SwarmTrace(ttl_seconds=3600.0)
+    trace_bob = SwarmTrace(ttl_seconds=3600.0)
+
+    # GossipTransport: topic-based transport (in-process demo if libp2p absent)
+    gossip_alice = GossipTransport(node_id="node-alpha", topics={"spore"})
+    gossip_bob = GossipTransport(node_id="node-beta", topics={"spore"})
+
+    received = {}
+
+    def on_message(msg: GossipedMessage) -> None:
+        received[msg.message_id] = msg
+
+    gossip_bob.subscribe("spore", on_message)
+
     spore, msg_id = alice.pack({"intent": "resonate", "phase": 0.7})
-    
-    # Verify unpack works with proper group + node signature
+    spore, msg_id = alice.pack({"intent": "grow", "phase": 0.9})
+
+    alice.merge_bloom_filter(bob.bloom)
+
+    # Broadcast via gossip transport
+    gossip_alice.gossip_subscribe_and_publish(
+        "spore", spore, sender_id="node-alpha", vector_clock=pheromone_alice.tick(), message_id=msg_id.decode()
+    )
+
+    # Bob unpacks via Spore
     result = bob.unpack(spore)
     print("bob sees:", result)
-    
+
     # Replay check via message ID
     result2 = bob.unpack(spore)
     print("replay filtered:", result2)  # → None on replay
-    
+
     # Poison detection for tampered messages
-    # Create a new message instead of trying to tamper with bytes directly
     fake_spore, fake_id = alice.pack({"intent": "subvert"})
-    # Simulate tampered bytes by corrupting a single byte
     if len(fake_spore) > 0:
         tampered = bytearray(fake_spore)
         tampered[0] = tampered[0] ^ 0xFF
         print("tampered:", bob.unpack(bytes(tampered)))  # → __poison__
     else:
         print("fake message empty, cannot test tampering")
+
+    # SwarmTrace demo
+    trace_alice.add(msg_id.decode(), "tag-" + msg_id.decode(), pheromone_alice.tick())
+    trace_alice.remove(msg_id.decode(), "tag-" + msg_id.decode())
+    trace_bob.merge(trace_alice)
+    pruned = trace_bob.prune()
+
+    print("gossip enabled:", gossip_alice._gossip_enabled, gossip_bob._gossip_enabled)
+    print("received messages:", len(received))
