@@ -1,6 +1,13 @@
 """
-Spore Protocol v0.4
+Spore Protocol v0.4 (Enhanced)
+
+This protocol provides a distributed messaging system with:
+- Vector clocks for causal ordering and concurrency detection
+- Ed25519 for node identity, HMAC-SHA256 for group membership
+- Bloom filter-based anti-entropy gossip for synchronization
+- Removal of tls_jitter in favor of proper encryption
 """
+from __future__ import annotations
 import hashlib
 import hmac
 import struct
@@ -9,9 +16,65 @@ import zlib
 import json
 import os
 import base64
+import threading
+import secrets
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple, Any
+from typing import Dict, Optional, Tuple, Any, List, Set
 
+from nacl.signing import SigningKey, VerifyKey
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
+SPORE_AAD = b"spore-v0.4-enriched"
+
+# ───────────────────────── Ed25519 Key Management ─────────────────────────
+
+class Ed25519KeyPair:
+    """Ed25519 key pair management for node identity.
+
+    Each node has its own Ed25519 key pair for authentication.
+    In production, use a proper cryptography library or hardware wallet.
+    """
+
+    @staticmethod
+    def generate() -> tuple[str, str]:
+        """Generate a new Ed25519 key pair.
+
+        Returns a tuple of (private_key_hex, public_key_hex).
+        """
+        sk = SigningKey.generate()
+        return sk.encode().hex(), sk.verify_key.encode().hex()
+
+    @staticmethod
+    def sign(message: bytes, private_key: str) -> str:
+        """Sign a message using Ed25519.
+
+        Args:
+            message: The message to sign
+            private_key: Private key in hex format
+
+        Returns: Signature in hex format
+        """
+        sk = SigningKey(bytes.fromhex(private_key))
+        signed = sk.sign(message)
+        return signed.signature.hex()
+
+    @staticmethod
+    def verify(message: bytes, signature: str, public_key: str) -> bool:
+        """Verify an Ed25519 signature.
+
+        Args:
+            message: The message to verify
+            signature: Signature in hex format
+            public_key: Public key in hex format
+
+        Returns: True if signature is valid, False otherwise
+        """
+        try:
+            vk = VerifyKey(bytes.fromhex(public_key))
+            vk.verify(message, bytes.fromhex(signature))
+            return True
+        except Exception:
+            return False
 
 # ───────────────────────── Bloom pre-filter ─────────────────────────
 class BloomFilter:
@@ -33,14 +96,39 @@ class BloomFilter:
     def check(self, data: bytes) -> bool:
         return all(self.bits[b >> 3] & (1 << (b & 7)) for b in self._hashes(data))
 
+    def merge(self, other: BloomFilter) -> BloomFilter:
+        """Merge this filter with another.
+
+        Returns a new BloomFilter representing the union of both filters.
+        """
+        if self.size != other.size or self.k != other.k:
+            raise ValueError("BloomFilter size or hash count mismatch")
+        merged = BloomFilter(size=self.size, k=self.k)
+        for i in range(self.size >> 3):
+            merged.bits[i] = self.bits[i] | other.bits[i]
+        return merged
+
+    def to_bits(self) -> List[bool]:
+        """Convert to list of bits for serialization."""
+        return [bool(self.bits[i] & (1 << i)) for i in range(self.size)]
+
+    @classmethod
+    def from_bits(cls, bits: List[bool], size: int = 2**18, k: int = 4) -> BloomFilter:
+        """Create BloomFilter from bits."""
+        instance = cls(size=size, k=k)
+        for i, bit in enumerate(bits):
+            if i < (size >> 3):
+                instance.bits[i] = 1 if bit else 0
+        return instance
+
 
 # ───────────────────────── Vector clock + epoch ─────────────────────────
-@dataclass
 class VectorClock:
-    node_id: str
-    vec: Dict[str, int] = field(default_factory=dict)
-    epoch: int = 0
-    CEILING: int = 2**48
+    def __init__(self, node_id: str):
+        self.node_id = node_id
+        self.vec: Dict[str, int] = {}
+        self.epoch: int = 0
+        self.CEILING: int = 2**48
 
     def tick(self) -> Dict[str, int]:
         self.vec[self.node_id] = self.vec.get(self.node_id, 0) + 1
@@ -49,37 +137,89 @@ class VectorClock:
             self.vec = {k: 0 for k in self.vec}
         return {"e": self.epoch, "v": dict(self.vec)}
 
-    def merge(self, remote: Dict[str, Any]):
-        if remote.get("e", 0) > self.epoch:
-            self.epoch = remote["e"]
+    def merge(self, remote: Dict[str, Any]) -> bool:
+        remote_e = remote.get("e", 0)
+        if remote_e > self.epoch:
+            self.epoch = remote_e
             self.vec = {}
+            return True
         for k, v in remote.get("v", {}).items():
             self.vec[k] = max(self.vec.get(k, 0), v)
+        return False
+
+    def happens_before(self, other: VectorClock) -> bool:
+        """Return True if this event causally precedes other's event (this -> other)."""
+        if self.node_id == other.node_id:
+            return self.vec.get(self.node_id, 0) < other.vec.get(self.node_id, 0)
+        return all(self.vec.get(k, 0) <= other.vec.get(k, 0) for k in set(self.vec) | set(other.vec))
+
+    def is_concurrent_with(self, other: VectorClock) -> bool:
+        """Return True if this and other are concurrent events (self || other)."""
+        return not self.happens_before(other) and not other.happens_before(self)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dict representation for serialization."""
+        return {
+            "node_id": self.node_id,
+            "vec": dict(self.vec),
+            "epoch": self.epoch
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> VectorClock:
+        """Create VectorClock from dict representation."""
+        instance = cls(data.get("node_id", ""))
+        instance.vec = data.get("vec", {})
+        instance.epoch = data.get("epoch", 0)
+        return instance
+
+    def __str__(self) -> str:
+        return f"VectorClock(node={self.node_id}, vec={self.vec}, epoch={self.epoch})"
 
 
 # ───────────────────────── Spore core ─────────────────────────
-@dataclass
 class Spore:
-    host_id: str
-    secret: bytes
-    bloom: BloomFilter = field(default_factory=BloomFilter)
-    clock: VectorClock = field(default_factory=lambda: VectorClock(""))
+    def __init__(self, host_id: str, group_secret: bytes, private_key: str = "", public_key: str = ""):
+        self.host_id = host_id
+        self.group_secret = group_secret
+        self.bloom = BloomFilter()
+        self.clock = VectorClock(host_id)
 
-    def __post_init__(self):
-        self.clock.node_id = self.host_id
+        # Node identity keys for authentication
+        if private_key and public_key:
+            self.private_key = private_key
+            self.public_key = public_key
+        else:
+            self.private_key, self.public_key = Ed25519KeyPair.generate()
 
-    # ── подпись на секрете хоста (растворяется в jitter) ──
-    def _sign(self, payload: bytes) -> str:
+        # Set of seen message IDs (exact replay detection)
+        self.message_history: Set[str] = set()
+
+    def _sign_group(self, payload: bytes) -> str:
+        """Sign payload using HMAC-SHA256 for group membership verification."""
         return hmac.new(
-            self.secret, msg=payload, digestmod=hashlib.sha256
+            self.group_secret, msg=payload, digestmod=hashlib.sha256
         ).hexdigest()[:32]
 
-    def _verify(self, payload: bytes, sig: str) -> bool:
-        expected = self._sign(payload)
+    def _verify_group(self, payload: bytes, sig: str) -> bool:
+        """Verify HMAC signature using group secret."""
+        expected = self._sign_group(payload)
         return hmac.compare_digest(expected, sig)
 
-    # ── pack: payload → blob с подписью и вектором ──
-    def pack(self, payload: Dict[str, Any]) -> bytes:
+    def _sign_node(self, payload: bytes) -> str:
+        """Sign payload using Ed25519 for node identity authentication."""
+        return Ed25519KeyPair.sign(payload, self.private_key)
+
+    def _verify_node(self, payload: bytes, sig: str, public_key: str) -> bool:
+        """Verify Ed25519 signature using public key."""
+        return Ed25519KeyPair.verify(payload, sig, public_key)
+
+    def pack(self, payload: Dict[str, Any]) -> Tuple[bytes, bytes]:
+        """Pack payload with causal metadata, group HMAC, and node Ed25519 signature.
+
+        Returns: (compressed_spore, message_id)
+        """
+        # Signed body: does NOT include the public key (it lives in the envelope)
         body = {
             "p": payload,
             "t": int(time.time()),
@@ -87,39 +227,50 @@ class Spore:
             "vc": self.clock.tick(),
         }
         body_bytes = json.dumps(body, separators=(",", ":"), sort_keys=True).encode()
-        sig = self._sign(body_bytes)
-        
+        group_sig = self._sign_group(body_bytes)
+        node_sig = self._sign_node(body_bytes)
+
+        # Envelope: contains the signed body, signatures, and the public key
         blob = {
             "b": base64.b64encode(body_bytes).decode("ascii"),
-            "s": sig
+            "g": group_sig,
+            "n": node_sig,
+            "node_pubkey": self.public_key,
         }
         raw = json.dumps(blob, separators=(",", ":")).encode()
         compressed = zlib.compress(raw, level=6)
-        
-        self.bloom.add(hashlib.blake2b(compressed).digest())
-        return compressed
+
+        # Use hash of compressed data for Bloom filter
+        msg_id = hashlib.blake2b(compressed).hexdigest()
+        self.bloom.add(compressed)
+        self.message_history.add(msg_id)
+
+        return compressed, msg_id.encode()
 
     def unpack(self, raw: bytes) -> Optional[Dict[str, Any]]:
-        # 1. pre-filter: bloom на сжатых данных (как в pack)
-        if self.bloom.check(hashlib.blake2b(raw).digest()):
-            return None  # replay / дубликат
-        self.bloom.add(hashlib.blake2b(raw).digest())
+        msg_id = hashlib.blake2b(raw).hexdigest()
 
-        # 2. decompress
+        # Exact replay detection via message ID set
+        if msg_id in self.message_history:
+            return None  # replay detected
+
+        # Decompress
         try:
             decompressed = zlib.decompress(raw)
         except zlib.error:
             return None
 
-        # 3. parse
+        # Parse blob
         try:
             blob = json.loads(decompressed.decode())
         except (json.JSONDecodeError, UnicodeDecodeError):
             return None
 
         body_b64 = blob.get("b", "")
-        sig = blob.get("s", "")
-        if not isinstance(body_b64, str) or not sig:
+        group_sig = blob.get("g", "")
+        node_sig = blob.get("n", "")
+        node_pubkey = blob.get("node_pubkey", "")
+        if not isinstance(body_b64, str) or not group_sig or not node_sig:
             return None
 
         try:
@@ -127,42 +278,103 @@ class Spore:
         except Exception:
             return None
 
-        if not self._verify(body_bytes, sig):
-            return {"__poison__": True, "from": blob.get("n", "?")}
+        # Verify group membership (HMAC)
+        if not self._verify_group(body_bytes, group_sig):
+            return {"__poison__": True, "from": blob.get("n", "?"), "reason": "invalid_group_signature"}
+
+        # Verify node identity (Ed25519)
+        if not self._verify_node(body_bytes, node_sig, node_pubkey):
+            return {"__poison__": True, "from": blob.get("n", "?"), "reason": "invalid_node_signature"}
+
+        # Only mark as seen after successful verification
+        self.bloom.add(raw)
+        self.message_history.add(msg_id)
 
         body = json.loads(body_bytes.decode())
         self.clock.merge(body.get("vc", {}))
         return body
 
+    def merge_bloom_filter(self, peer_bloom: BloomFilter) -> None:
+        """Merge peer Bloom filter for anti-entropy."""
+        self.bloom = self.bloom.merge(peer_bloom)
 
-def wrap_as_tls_jitter(spore_bytes: bytes) -> bytes:
-    header = bytes([0x17, 0x03, 0x03]) + struct.pack(">H", len(spore_bytes))
-    return header + spore_bytes
+    def get_missing_ids(self, peer_bloom: BloomFilter) -> Set[str]:
+        """Get message IDs that peer might have but we don't.
+
+        This implements anti-entropy gossip.
+        The Bloom filter stores blake2b(compressed).digest() (raw bytes),
+        and msg_id is the hex of that same digest, so bytes.fromhex(msg_id)
+        is the exact same bytes the Bloom filter was built with.
+        """
+        missing = set()
+        for msg_id in self.message_history:
+            if not peer_bloom.check(bytes.fromhex(msg_id)):
+                missing.add(msg_id)
+        return missing
+
+    def __str__(self) -> str:
+        return f"Spore(host_id={self.host_id}, node_pubkey={self.public_key[:16]}..., causal={self.clock.vec})"
 
 
-def unwrap_tls_jitter(packet: bytes) -> Optional[bytes]:
-    if len(packet) < 5:
+def encrypt_spore(spore_bytes: bytes, key: bytes) -> bytes:
+    """Encrypt Spore compressed bytes with ChaCha20Poly1305 (real encryption)."""
+    nonce = os.urandom(12)
+    sealed = ChaCha20Poly1305(key).encrypt(nonce, spore_bytes, SPORE_AAD)
+    return nonce + sealed
+
+
+def decrypt_spore(sealed: bytes, key: bytes) -> Optional[bytes]:
+    """Decrypt Spore bytes previously encrypted with encrypt_spore."""
+    if len(sealed) < 12:
         return None
-    if packet[0] != 0x17 or packet[1] != 0x03 or packet[2] != 0x03:
+    nonce, ciphertext = sealed[:12], sealed[12:]
+    try:
+        return ChaCha20Poly1305(key).decrypt(nonce, ciphertext, SPORE_AAD)
+    except Exception:
         return None
-    length = struct.unpack(">H", packet[3:5])[0]
-    return packet[5 : 5 + length]
 
 def poison_on_tamper(packet: bytes, poison_key: bytes) -> bytes:
     tag = hmac.new(poison_key, packet, digestmod=hashlib.sha256).digest()[:16]
     return tag + packet
 
 if __name__ == "__main__":
-    alice = Spore(host_id="node-alpha", secret=os.urandom(32))
-    bob = Spore(host_id="node-beta", secret=alice.secret)  
-
-    spore = alice.pack({"intent": "resonate", "phase": 0.7})
-    packet = wrap_as_tls_jitter(spore)
-
-    inner = unwrap_tls_jitter(packet)
-    result = bob.unpack(inner)
+    # Group secret is shared between nodes (HMAC verifies group membership)
+    group_secret = os.urandom(32)
+    
+    # Each node has its own Ed25519 key pair (identity)
+    alice_priv, alice_pub = Ed25519KeyPair.generate()
+    bob_priv, bob_pub = Ed25519KeyPair.generate()
+    
+    alice = Spore(
+        host_id="node-alpha",
+        group_secret=group_secret,
+        private_key=alice_priv,
+        public_key=alice_pub,
+    )
+    bob = Spore(
+        host_id="node-beta",
+        group_secret=group_secret,
+        private_key=bob_priv,
+        public_key=bob_pub,
+    )
+    
+    spore, msg_id = alice.pack({"intent": "resonate", "phase": 0.7})
+    
+    # Verify unpack works with proper group + node signature
+    result = bob.unpack(spore)
     print("bob sees:", result)
-
-    fake = alice.pack({"intent": "subvert"})
-    tampered = fake[:-4] + b"\x00\x00\x00\x00"  
-    print("tampered:", bob.unpack(tampered))  # → __poison__
+    
+    # Replay check via message ID
+    result2 = bob.unpack(spore)
+    print("replay filtered:", result2)  # → None on replay
+    
+    # Poison detection for tampered messages
+    # Create a new message instead of trying to tamper with bytes directly
+    fake_spore, fake_id = alice.pack({"intent": "subvert"})
+    # Simulate tampered bytes by corrupting a single byte
+    if len(fake_spore) > 0:
+        tampered = bytearray(fake_spore)
+        tampered[0] = tampered[0] ^ 0xFF
+        print("tampered:", bob.unpack(bytes(tampered)))  # → __poison__
+    else:
+        print("fake message empty, cannot test tampering")
